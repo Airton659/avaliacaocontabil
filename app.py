@@ -1,4 +1,4 @@
-# contas_dashboard_streamlit.py
+# app.py
 # -*- coding: utf-8 -*-
 # Regras:
 # - NUNCA agrega CO_TP_CCOR diferentes. Cada série/linha é (Conta, CO_TP_CCOR).
@@ -6,12 +6,21 @@
 # - Matriz cronológica não substitui ausentes por zero (vazio != zero).
 # - Abas SURGIU/ZEROU expandidas por tipo; função de expansão preserva colunas de referência.
 # - Navegação na lateral; filtros dentro de cada página.
+# - Leitura automática do único .xlsx na MESMA pasta do app.
+
 
 import io
-import pandas as pd
 import numpy as np
+import pandas as pd
 import streamlit as st
 import plotly.express as px
+import sys, os
+
+import sys, os
+def _get_base_dir():
+    return os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = _get_base_dir()
+
 
 # ----------------------
 # Config & Constantes
@@ -43,14 +52,19 @@ EV_SALDO_ANT = "SALDO_ANTERIOR"  # só em SURGIU
 # Helpers
 # ----------------------
 def format_brl(value) -> str:
-    """Formata números como Real: R$ 1.234.567,89"""
+    """Formata números como Real: R$ 1.234.567,89 (trata NaN/None/inf)."""
+    # Trata valores nulos/NaN/inf logo de cara
+    if value is None:
+        return "-"
     try:
         x = float(value)
     except (TypeError, ValueError):
         return "-"
+    if np.isnan(x) or np.isinf(x):
+        return "-"
     neg = x < 0
     x = abs(x)
-    inteiro, decimal = divmod(round(x * 100), 100)
+    inteiro, decimal = divmod(int(round(x * 100)), 100)
     inteiro_str = f"{int(inteiro):,}".replace(",", ".")
     decimal_str = f"{int(decimal):02d}"
     s = f"R$ {inteiro_str},{decimal_str}"
@@ -82,30 +96,6 @@ def build_month_slider_options(df_mes_valido: pd.DataFrame):
         labels = [month_label(d) for d in datas]
         return datas, labels
     return [], []
-
-@st.cache_data(show_spinner=False)
-def load_excel(file_bytes: bytes):
-    with io.BytesIO(file_bytes) as buffer:
-        dados = pd.read_excel(buffer, sheet_name="DADOS")
-        surg = pd.read_excel(buffer, sheet_name="SALDO-SURGIU")
-        zerou = pd.read_excel(buffer, sheet_name="SALDO-ZEROU")
-    return dados, surg, zerou
-
-def ensure_datetime_and_flags(dados: pd.DataFrame) -> pd.DataFrame:
-    """Cria MES_VALIDO (1..12) e DATA só para meses válidos; mantém mês 0 nas tabelas."""
-    y = pd.to_numeric(dados.get(COL_ANO, pd.Series(dtype="float")), errors="coerce")
-    m = pd.to_numeric(dados.get(COL_MES, pd.Series(dtype="float")), errors="coerce")
-    dados["MES_VALIDO"] = m.between(1, 12)
-    dados[COL_DATA] = pd.NaT
-    mask_valid = y.notna() & m.notna() & dados["MES_VALIDO"]
-    if mask_valid.any():
-        yy = y[mask_valid].astype(int)
-        mm = m[mask_valid].astype(int)
-        dados.loc[mask_valid, COL_DATA] = pd.to_datetime(dict(year=yy, month=mm, day=1), errors="coerce")
-    qtd_m0 = int((m == 0).sum())
-    if qtd_m0 > 0:
-        st.info(f"ℹ️ {qtd_m0} linha(s) com mês = 0. Elas aparecem nas tabelas, mas ficam fora de KPIs e gráficos.")
-    return dados
 
 def name_map(dados: pd.DataFrame) -> pd.DataFrame:
     return (
@@ -158,6 +148,23 @@ def apply_hover_brl(fig):
     fig.update_traces(hovertemplate="%{text}<extra></extra>")
     return fig
 
+def ensure_datetime_and_flags(dados: pd.DataFrame) -> pd.DataFrame:
+    """Cria MES_VALIDO (1..12) e DATA só para meses válidos; mantém mês 0 nas tabelas."""
+    y = pd.to_numeric(dados.get(COL_ANO, pd.Series(dtype="float")), errors="coerce")
+    m = pd.to_numeric(dados.get(COL_MES, pd.Series(dtype="float")), errors="coerce")
+    dados["MES_VALIDO"] = m.between(1, 12)
+    dados[COL_DATA] = pd.NaT
+    mask_valid = y.notna() & m.notna() & dados["MES_VALIDO"]
+    if mask_valid.any():
+        yy = y[mask_valid].astype(int)
+        mm = m[mask_valid].astype(int)
+        dados.loc[mask_valid, COL_DATA] = pd.to_datetime(dict(year=yy, month=mm, day=1), errors="coerce")
+    qtd_m0 = int((m == 0).sum())
+    if qtd_m0 > 0:
+        st.info(f"ℹ️ {qtd_m0} linha(s) com mês = 0. Elas aparecem nas tabelas, mas ficam fora de KPIs e gráficos.")
+    return dados
+
+# Necessária nas abas Surgiu/Zerou
 def expandir_eventos_por_tipo(event_df: pd.DataFrame, usar_mes: str) -> pd.DataFrame:
     """
     Retorna tabela expandida em (Conta, Tipo) para o período do evento.
@@ -186,17 +193,48 @@ def expandir_eventos_por_tipo(event_df: pd.DataFrame, usar_mes: str) -> pd.DataF
     return j
 
 # ----------------------
-# UI (upload + navegação lateral)
+# Leitura automática do .xlsx na mesma pasta
+# ----------------------
+def _get_base_dir():
+    # Quando estiver "congelado" pelo PyInstaller, usa a pasta do executável
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    # Em desenvolvimento, usa a pasta do próprio arquivo
+    return os.path.dirname(os.path.abspath(__file__))
+
+BASE_DIR = _get_base_dir()
+
+def encontrar_xlsx_unico(pasta: str) -> str:
+    xlsx = [f for f in os.listdir(pasta) if f.lower().endswith(".xlsx")]
+    if not xlsx:
+        st.error("Nenhum arquivo .xlsx encontrado na pasta do app.")
+        st.stop()
+    if len(xlsx) > 1:
+        st.warning("Mais de um .xlsx encontrado na pasta. Usando o primeiro em ordem alfabética.")
+        xlsx.sort()
+    return os.path.join(pasta, xlsx[0])
+
+@st.cache_data(show_spinner=False)
+def load_excel_from_path(file_path: str, mtime: float):
+    """Lê as 3 planilhas do Excel. mtime no cache garante recarregar quando o arquivo é atualizado."""
+    with pd.ExcelFile(file_path) as xls:
+        dados = pd.read_excel(xls, sheet_name="DADOS")
+        surg = pd.read_excel(xls, sheet_name="SALDO-SURGIU")
+        zerou = pd.read_excel(xls, sheet_name="SALDO-ZEROU")
+    return dados, surg, zerou
+
+# ----------------------
+# UI (cabeçalho)
 # ----------------------
 st.title("📊 Painel Contábil (Streamlit)")
-st.caption("Sem agregação entre CO_TP_CCOR. Mês 0 fora de KPIs/gráficos; visível nas tabelas.")
+st.caption("Leitura automática do .xlsx na mesma pasta. Sem agregação entre CO_TP_CCOR. Mês 0 fora de KPIs/gráficos; visível nas tabelas.")
 
-uploaded = st.file_uploader("📎 Envie o arquivo Excel", type=["xlsx", "xls"])
-if not uploaded:
-    st.info("🔼 Envie o arquivo para iniciar.")
-    st.stop()
+# Localiza e carrega o arquivo
+ARQ_XLSX = encontrar_xlsx_unico(BASE_DIR)
+MTIME = os.path.getmtime(ARQ_XLSX)
+st.info(f"📂 Arquivo carregado: **{os.path.basename(ARQ_XLSX)}** (última modificação: {pd.to_datetime(MTIME, unit='s'):%d/%m/%Y %H:%M})")
 
-dados, surg_raw, zerou_raw = load_excel(uploaded.read())
+dados, surg_raw, zerou_raw = load_excel_from_path(ARQ_XLSX, MTIME)
 
 # Preparação base
 dados = ensure_datetime_and_flags(dados)
@@ -221,8 +259,7 @@ page = st.sidebar.radio(
 if page == "Visão Geral da Conta":
     st.subheader("🔎 Visão Geral da Conta")
 
-    # Período por MÊS (select_slider com labels tipo Jan/2024)
-    datas_opts, labels_opts = build_month_slider_options(dados_analise_base)
+    datas_opts, _ = build_month_slider_options(dados_analise_base)
     if datas_opts:
         v0, v1 = st.select_slider(
             "Período (mensal)",
@@ -252,7 +289,7 @@ if page == "Visão Geral da Conta":
             co_sel = parse_co_from_label(tipo_sel_label)
 
             base_pair = dados_analise[(dados_analise[COL_NO_CONTA] == conta_sel) & (dados_analise[COL_CO_TP] == co_sel)].copy()
-            base_pair = base_pair.groupby(COL_DATA, as_index=False)[COL_SALDO].sum()
+            base_pair = base_pair.groupby(COL_DATA, as_index=False, observed=False)[COL_SALDO].sum()
 
             if base_pair.empty:
                 st.warning("Sem dados (com mês válido) para esse par Conta/Tipo no período.")
@@ -282,7 +319,7 @@ if page == "Visão Geral da Conta":
 elif page == "Análise Comparativa":
     st.subheader("📈 Análise Comparativa")
 
-    datas_opts, labels_opts = build_month_slider_options(dados_analise_base)
+    datas_opts, _ = build_month_slider_options(dados_analise_base)
     if datas_opts:
         v0, v1 = st.select_slider(
             "Período (mensal)",
@@ -319,7 +356,7 @@ elif page == "Análise Comparativa":
         if base.empty:
             st.warning("Sem dados no período selecionado para os pares escolhidos.")
         else:
-            grp = base.groupby(["LABEL", COL_DATA], as_index=False)[COL_SALDO].sum()
+            grp = base.groupby(["LABEL", COL_DATA], as_index=False, observed=False)[COL_SALDO].sum()
             chart_df = add_valor_fmt(grp, COL_SALDO)
             fig = px.line(chart_df, x=COL_DATA, y=COL_SALDO, color="LABEL", text="VALOR_FMT",
                           title="Comparativo (uma série por Conta | Tipo)", markers=True)
@@ -355,27 +392,45 @@ elif page == "Matriz Cronológica":
     df_rows = base_tab.copy()
     df_rows["ROW"] = df_rows.apply(lambda r: conta_tipo_label(r[COL_NO_CONTA], r[COL_CO_TP], r[COL_NO_TP]), axis=1)
 
-    pivot_vals = pd.pivot_table(
+    # >>>>>>>>>>>>>>> ALTERAÇÃO: distinguir ausência ( '-') de valor zero ('R$ 0,00') <<<<<<<<<<<<<<
+    col_mes = COL_MES_TXT if COL_MES_TXT in df_rows.columns else COL_DATA
+
+    # Soma dos saldos
+    pivot_sum = pd.pivot_table(
         df_rows,
         index="ROW",
-        columns=COL_MES_TXT if COL_MES_TXT in df_rows.columns else COL_DATA,
+        columns=col_mes,
         values=COL_SALDO,
-        aggfunc="sum"   # agrega apenas duplicatas do MESMO par
-        # sem fill_value -> ausentes ficam NaN (vazio != zero)
+        aggfunc="sum",
+        observed=False
     )
 
-    pivot_fmt = pivot_vals.applymap(lambda v: format_brl(v) if pd.notna(v) else "-")
-    nan_mask = pivot_vals.isna()
+    # Contagem real de linhas (indica se existe registro naquele mês)
+    df_rows["_cnt"] = 1
+    pivot_cnt = pd.pivot_table(
+        df_rows,
+        index="ROW",
+        columns=col_mes,
+        values="_cnt",
+        aggfunc="sum",
+        observed=False
+    )
+
+    has_record = pivot_cnt.fillna(0) > 0           # True = existe linha, False = não existe
+    to_show    = pivot_sum.where(has_record)       # onde não existe -> NaN (para virar '-')
+
+    pivot_fmt = to_show.map(lambda v: format_brl(v) if pd.notna(v) else "-")
+    # Estilo visual: cinza claro onde NÃO há registro
+    style_mask = (~has_record).values
     def _style(_):
-        return np.where(nan_mask.values, "background-color:#f6f6f6; color:#888;", "")
+        return np.where(style_mask, "background-color:#f6f6f6; color:#888;", "")
     st.dataframe(pivot_fmt.style.apply(_style, axis=None), use_container_width=True)
 
-    # Diagnóstico: linhas com alguns "-" (para você verificar na prática)
+    # Diagnóstico de células sem registro (usa pivot_cnt/has_record)
     with st.expander("🔎 Linhas com células vazias (mostrar até 100)"):
-        # lista meses/colunas com NaN
         empties = []
-        for i, row in pivot_vals.iterrows():
-            cols_na = row[row.isna()].index.tolist()
+        for i, row in has_record.iterrows():
+            cols_na = row[~row].index.tolist()   # meses onde não há registro
             if cols_na:
                 empties.append({"Conta | Tipo": i, "Meses sem registro": ", ".join(map(str, cols_na))})
         if empties:
@@ -384,6 +439,7 @@ elif page == "Matriz Cronológica":
             st.caption(f"Total de linhas com ao menos uma célula vazia: {len(empties)}")
         else:
             st.info("Não encontrei células vazias nesta seleção. Selecione outras contas para verificar.")
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 # ----------------------
 # PÁGINA: Saldo Surgiu
@@ -433,7 +489,7 @@ elif page == "Saldo Surgiu":
                 conta_escolhida, tipo_escolhido = escolha.split(" | ", 1)
                 co_tp = parse_co_from_label(tipo_escolhido)
                 base_ok = dados_analise_base[(dados_analise_base[COL_NO_CONTA] == conta_escolhida) & (dados_analise_base[COL_CO_TP] == co_tp)]
-                grp = base_ok.groupby(COL_DATA, as_index=False)[COL_SALDO].sum()
+                grp = base_ok.groupby(COL_DATA, as_index=False, observed=False)[COL_SALDO].sum()
                 if grp.empty:
                     st.info("Sem meses válidos para traçar o gráfico deste par.")
                 else:
@@ -482,7 +538,7 @@ elif page == "Saldo Zerou":
             cols_tab = [COL_NO_CONTA, "TIPO_ROT", "VALOR_QUE_ZEROU", EV_SEG_MES, EV_SEG_ANO]
             cols_tab = [c for c in cols_tab if c in exp_ant.columns]
             tabela = exp_ant[cols_tab].copy()
-            tabela["VALOR_QUE_ZEROU"] = tabela["VALOR_QUE_ZEROU"].apply(format_brl)
+            tabela["VALOR_QUE_ZEROU"] = tabela["VALOR_QUE_ZEROU"].apply(format_brl)  # <-- segura NaN
             if EV_SEG_MES in tabela.columns: tabela[EV_SEG_MES] = as_text_no_sep(tabela[EV_SEG_MES])
             if EV_SEG_ANO in tabela.columns: tabela[EV_SEG_ANO] = as_text_no_sep(tabela[EV_SEG_ANO])
             tabela.rename(columns={
@@ -501,7 +557,7 @@ elif page == "Saldo Zerou":
                 conta_escolhida, tipo_escolhido = escolha.split(" | ", 1)
                 co_tp = parse_co_from_label(tipo_escolhido)
                 base_ok = dados_analise_base[(dados_analise_base[COL_NO_CONTA] == conta_escolhida) & (dados_analise_base[COL_CO_TP] == co_tp)]
-                grp = base_ok.groupby(COL_DATA, as_index=False)[COL_SALDO].sum()
+                grp = base_ok.groupby(COL_DATA, as_index=False, observed=False)[COL_SALDO].sum()
                 if grp.empty:
                     st.info("Sem meses válidos para traçar o gráfico deste par.")
                 else:
